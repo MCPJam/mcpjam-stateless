@@ -1,0 +1,22 @@
+{
+  "name": "mcpjam-stateless",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Stateless MCP server (DRAFT-2026-v1) on Cloudflare Workers",
+  "scripts": {
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "cf-typegen": "wrangler types",
+    "link-sdk": "node ./scripts/link-sdk.mjs",
+    "postinstall": "node ./scripts/link-sdk.mjs"
+  },
+  "dependencies": {
+    "zod": "^4.3.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "wrangler": "^4.67.0"
+  }
+}
