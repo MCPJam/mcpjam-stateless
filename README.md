@@ -1,12 +1,19 @@
 # mcpjam-stateless
 
-Stateless MCP server (DRAFT-2026-v1) on Cloudflare Workers.
+Stateless MCP server (2026-07-28 RC) on Cloudflare Workers.
 
 Demonstrates the per-request `_meta` model from PR #2575 / #2567 / #2243 /
 #2549: no `initialize` handshake, `server/discover` for version negotiation,
 `subscriptions/listen` for streamed notifications, `InputRequiredResult` (MRTR)
 for server→client interactions, and the `Mcp-Method` / `Mcp-Name` /
 `Mcp-Param-*` header layer.
+
+> **Version-bridge note.** The SDK build this example symlinks still pins
+> the placeholder literal `DRAFT-2026-v1`. The spec (and mcpjam-backend +
+> inspector PR #2303) have moved to `2026-07-28`. A small HTTP shim in
+> `src/index.ts` translates the version string at the edge so the server
+> interops with bumped clients without forking the SDK. Delete the shim
+> once the SDK ships a build pinning `2026-07-28`.
 
 ## Setup
 
@@ -40,17 +47,18 @@ for transitive runtime deps (`zod`, `@cfworker/json-schema`, etc.).
 ## Smoke test
 
 ```sh
-META='"_meta":{"io.modelcontextprotocol/protocolVersion":"DRAFT-2026-v1","io.modelcontextprotocol/clientInfo":{"name":"curl","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}'
+META='"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"curl","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}'
 
 # Discover supported versions + capabilities
+# (response's `supportedVersions` will read "2026-07-28" thanks to the shim)
 curl -s -X POST http://127.0.0.1:8787/mcp \
-  -H 'Content-Type: application/json' -H 'MCP-Protocol-Version: DRAFT-2026-v1' \
+  -H 'Content-Type: application/json' -H 'MCP-Protocol-Version: 2026-07-28' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{$META}}"
 
 # Call echo
 curl -s -X POST http://127.0.0.1:8787/mcp \
   -H 'Content-Type: application/json' \
-  -H 'MCP-Protocol-Version: DRAFT-2026-v1' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
   -H 'Mcp-Method: tools/call' -H 'Mcp-Name: echo' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"},$META}}"
 ```
