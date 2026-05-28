@@ -4,5 +4,8 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-03-10",
   "compatibility_flags": ["nodejs_compat"],
-  "observability": { "enabled": true }
+  "observability": { "enabled": true },
+  "routes": [
+    { "pattern": "stateless.mcpjam.com", "custom_domain": true }
+  ]
 }
