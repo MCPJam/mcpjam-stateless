@@ -4,9 +4,11 @@ Stateless MCP server (2026-07-28 RC) on Cloudflare Workers.
 
 Demonstrates the per-request `_meta` model from PR #2575 / #2567 / #2243 /
 #2549: no `initialize` handshake, `server/discover` for version negotiation,
-`subscriptions/listen` for streamed notifications, `InputRequiredResult` (MRTR)
-for server→client interactions, and the `Mcp-Method` / `Mcp-Name` /
-`Mcp-Param-*` header layer.
+request-scoped SSE notifications, `InputRequiredResult` (MRTR) for
+server->client interactions, and the `Mcp-Method` / `Mcp-Name` /
+`Mcp-Param-*` header layer. `subscriptions/listen` is not advertised by this
+Worker example yet because the current SDK's in-memory subscription backend is
+not safe for cross-request delivery in Cloudflare Workers.
 
 > **Version-bridge note.** The SDK build this example symlinks still pins
 > the placeholder literal `DRAFT-2026-v1`. The spec (and mcpjam-backend +
@@ -20,8 +22,8 @@ for server→client interactions, and the `Mcp-Method` / `Mcp-Name` /
 Requires the local typescript-sdk checked out on `fweinberger/v2-http-stateless`
 and built. Expected layout:
 
-    ~/typescript-sdk/                ← branch fweinberger/v2-http-stateless, `pnpm install && pnpm -r build`
-    ~/mcpjam-stateless/              ← this project
+    ~/typescript-sdk/                # branch fweinberger/v2-http-stateless, `pnpm install && pnpm -r build`
+    ~/mcpjam-stateless/              # this project
 
 Then:
 
@@ -31,8 +33,12 @@ Then:
 `postinstall` symlinks the SDK's `packages/server` and `packages/core` into
 `node_modules/@modelcontextprotocol/`. The SDK is a pnpm workspace using
 `catalog:` deps, so installing it via `file:` from outside the workspace
-doesn't work — symlinks let esbuild walk up to the SDK's own `node_modules`
+doesn't work - symlinks let esbuild walk up to the SDK's own `node_modules`
 for transitive runtime deps (`zod`, `@cfworker/json-schema`, etc.).
+
+If your SDK checkout lives elsewhere:
+
+    MCP_TYPESCRIPT_SDK=/absolute/path/to/typescript-sdk npm install
 
 ## Tools
 
@@ -41,8 +47,7 @@ for transitive runtime deps (`zod`, `@cfworker/json-schema`, etc.).
 | `echo`         | Happy path; emits `notifications/message` if `_meta.logLevel` ≥ info |
 | `execute-sql`  | `x-mcp-header` annotation → `Mcp-Param-Region` header validation |
 | `ask-name`     | MRTR elicitation; needs `clientCapabilities.elicitation.form`    |
-| `summarize`    | MRTR sampling; needs `clientCapabilities.sampling`               |
-| `retoggle-echo`| Toggles echo and fires `notifications/tools/list_changed`        |
+| `summarize`    | Deprecated Sampling via MRTR; needs `clientCapabilities.sampling` |
 
 ## Smoke test
 
@@ -61,11 +66,18 @@ curl -s -X POST http://127.0.0.1:8787/mcp \
   -H 'MCP-Protocol-Version: 2026-07-28' \
   -H 'Mcp-Method: tools/call' -H 'Mcp-Name: echo' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"message\":\"hi\"},$META}}"
+
+# The retired placeholder literal is rejected at the edge
+DRAFT_META='"_meta":{"io.modelcontextprotocol/protocolVersion":"DRAFT-2026-v1","io.modelcontextprotocol/clientInfo":{"name":"curl","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}'
+curl -s -X POST http://127.0.0.1:8787/mcp \
+  -H 'Content-Type: application/json' -H 'MCP-Protocol-Version: DRAFT-2026-v1' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"server/discover\",\"params\":{$DRAFT_META}}"
 ```
 
 Expected error paths:
 
 - Wrong `MCP-Protocol-Version` header (vs body) → `400 -32001 HeaderMismatch`
+- `DRAFT-2026-v1` → `400 -32004 Unsupported protocol version`
 - Unknown method → `404 -32601`
 - GET / DELETE → `405`
 - `tools/call ask-name` without `clientCapabilities.elicitation` → `400 -32003 MissingRequiredClientCapability`
