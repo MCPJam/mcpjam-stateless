@@ -1,4 +1,4 @@
-// Stateless MCP server (DRAFT-2026-v1) on Cloudflare Workers.
+// Stateless MCP server (2026-07-28 RC) on Cloudflare Workers.
 //
 // What "stateless" means here, per the new spec:
 //   * No `initialize` handshake. Each request carries its own
@@ -31,6 +31,10 @@ const server = new McpServer(
       tools: { listChanged: true },
       logging: {},
     },
+    // Advertise only the 2026 RC. Written as the SDK's placeholder
+    // literal because that's what this SDK build still pins; the
+    // version-bridge below rewrites it to "2026-07-28" outbound.
+    supportedProtocolVersions: ["DRAFT-2026-v1"],
   },
 );
 
@@ -201,15 +205,156 @@ server.registerTool(
 //   * Status code mapping (404 for unknown method, 400 for invalid params,
 //     500 for internal errors, 200 for normal results).
 const mcp = handleHttp(server.server, {
-  // DNS-rebinding guard — comment out or expand for production.
-  allowedHosts: ["127.0.0.1", "localhost", "[::1]"],
+  // DNS-rebinding guard. Accepts local dev hosts plus the deployed worker
+  // hostname. Tighten if you bind a custom domain.
+  allowedHosts: [
+    "127.0.0.1",
+    "localhost",
+    "[::1]",
+    "mcpjam-stateless.marcelo-1cb.workers.dev",
+  ],
   maxBodyBytes: 1 * 1024 * 1024,
 });
+
+// ── version bridge ────────────────────────────────────────
+// The symlinked SDK still pins the placeholder literal "DRAFT-2026-v1".
+// The spec has since pinned the same wire protocol as "2026-07-28"
+// (modelcontextprotocol/main @ a11b1550), and mcpjam-backend +
+// inspector PR #2303 have fully swapped to the new literal. Until the
+// SDK ships a build that pins 2026-07-28 too, we translate the version
+// string at the HTTP edge so this example interops with the bumped
+// clients without forking the SDK.
+//
+// Delete this whole block (and call `mcp` directly from `fetch`) once
+// the SDK exports 2026-07-28.
+const WIRE_VERSION = "2026-07-28"; // what bumped clients speak
+const SDK_VERSION = "DRAFT-2026-v1"; // what this SDK build speaks
+
+// Outbound JSON keys that ever carry a protocol-version string:
+//   * `supportedVersions` in DiscoverResult
+//   * `supported` / `requested` in UnsupportedProtocolVersionErrorData
+// Tool content (`content`, `structuredContent`) is never rewritten, so
+// an `echo` of the literal `"DRAFT-2026-v1"` round-trips unchanged.
+const VERSION_KEYS = new Set(["supportedVersions", "supported", "requested"]);
+
+// Walks `value` and rewrites string leaves equal to `from` → `to`, but
+// only when the enclosing key (anywhere up the path) is in VERSION_KEYS.
+// `inside` propagates that gate through nested arrays/objects so that
+// e.g. `supportedVersions: ["DRAFT-2026-v1"]` rewrites, while
+// `structuredContent: { echoed: "DRAFT-2026-v1" }` does not.
+function swapVersion(value: unknown, from: string, to: string, inside = false): unknown {
+  if (Array.isArray(value)) return value.map((v) => swapVersion(v, from, to, inside));
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = swapVersion(v, from, to, inside || VERSION_KEYS.has(k));
+    }
+    return out;
+  }
+  if (inside && typeof value === "string" && value === from) return to;
+  return value;
+}
+
+function rewriteSseLine(line: string): string {
+  // SSE: each event has one or more `data:` lines whose payload is JSON.
+  if (!line.startsWith("data:")) return line;
+  const payload = line.slice("data:".length).replace(/^\s/, "");
+  const trailing = line.endsWith("\r\n") ? "\r\n" : line.endsWith("\n") ? "\n" : "";
+  try {
+    const json = JSON.parse(payload);
+    return `data: ${JSON.stringify(swapVersion(json, SDK_VERSION, WIRE_VERSION))}${trailing}`;
+  } catch {
+    return line;
+  }
+}
+
+async function bridgedMcp(request: Request): Promise<Response> {
+  // ── inbound: WIRE → SDK ───────────────────────────────────
+  const headers = new Headers(request.headers);
+  if (headers.get("mcp-protocol-version") === WIRE_VERSION) {
+    headers.set("mcp-protocol-version", SDK_VERSION);
+  }
+  // Body may be empty for malformed requests; let the SDK reject those.
+  const rawBody = await request.text();
+  let body = rawBody;
+  if (rawBody.length > 0) {
+    try {
+      const json = JSON.parse(rawBody);
+      const meta = json?.params?._meta;
+      const key = "io.modelcontextprotocol/protocolVersion";
+      if (meta && typeof meta === "object" && meta[key] === WIRE_VERSION) {
+        meta[key] = SDK_VERSION;
+        body = JSON.stringify(json);
+      }
+    } catch {
+      /* not JSON — pass through, SDK will reject */
+    }
+  }
+  // Drop content-length; the runtime recomputes it from the new body.
+  headers.delete("content-length");
+  const inner = new Request(request.url, {
+    method: request.method,
+    headers,
+    body: body.length > 0 ? body : undefined,
+  });
+
+  const response = await mcp(inner);
+
+  // ── outbound: SDK → WIRE ──────────────────────────────────
+  const ctype = response.headers.get("content-type") ?? "";
+
+  if (ctype.startsWith("application/json")) {
+    const text = await response.text();
+    const outHeaders = new Headers(response.headers);
+    outHeaders.delete("content-length");
+    try {
+      const rewritten = JSON.stringify(swapVersion(JSON.parse(text), SDK_VERSION, WIRE_VERSION));
+      return new Response(rewritten, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: outHeaders,
+      });
+    } catch {
+      return new Response(text, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: outHeaders,
+      });
+    }
+  }
+
+  if (ctype.startsWith("text/event-stream") && response.body) {
+    let buffer = "";
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    const transform = new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        buffer += decoder.decode(chunk, { stream: true });
+        let nl: number;
+        while ((nl = buffer.indexOf("\n")) !== -1) {
+          const line = buffer.slice(0, nl + 1);
+          buffer = buffer.slice(nl + 1);
+          controller.enqueue(encoder.encode(rewriteSseLine(line)));
+        }
+      },
+      flush(controller) {
+        if (buffer.length > 0) controller.enqueue(encoder.encode(rewriteSseLine(buffer)));
+      },
+    });
+    return new Response(response.body.pipeThrough(transform), {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  }
+
+  return response;
+}
 
 export default {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/mcp") return mcp(request);
+    if (url.pathname === "/mcp") return bridgedMcp(request);
     return new Response(landingHtml(), {
       headers: { "Content-Type": "text/html; charset=utf-8" },
     });
@@ -221,7 +366,7 @@ function landingHtml(): string {
 <html><body style="font-family:system-ui;display:grid;place-items:center;min-height:100vh;margin:0">
   <div style="text-align:center;max-width:560px">
     <h1>mcpjam-stateless</h1>
-    <p>Stateless MCP server (DRAFT-2026-v1). POST JSON-RPC to <code>/mcp</code>.</p>
+    <p>Stateless MCP server (2026-07-28 RC). POST JSON-RPC to <code>/mcp</code>.</p>
     <p>Try: <code>server/discover</code>, <code>tools/list</code>, <code>tools/call</code>.</p>
   </div>
 </body></html>`;

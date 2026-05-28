@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "description": "Stateless MCP server (DRAFT-2026-v1) on Cloudflare Workers",
+  "description": "Stateless MCP server (2026-07-28 RC) on Cloudflare Workers",
   "scripts": {
     "dev": "wrangler dev",
     "start": "wrangler dev",
