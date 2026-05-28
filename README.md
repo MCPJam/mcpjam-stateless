@@ -1,6 +1,6 @@
 # mcpjam-stateless
 
-A reference Model Context Protocol server demonstrating the **stateless** transport from the upcoming 2026-07-28 spec, running on Cloudflare Workers.
+A reference MCP server demonstrating the **stateless** transport from the upcoming 2026-07-28 spec
 
 Live at **https://stateless.mcpjam.com/mcp**.
 
