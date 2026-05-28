@@ -277,6 +277,98 @@ function messagesFromBody(body: unknown): unknown[] {
   return Array.isArray(body) ? body : [body];
 }
 
+// Methods that REQUIRE Mcp-Name per transports.mdx §Standard Request Headers.
+// The header value mirrors params.name (or params.uri for resources/read).
+const MCP_NAME_SOURCE: Record<string, "name" | "uri"> = {
+  "tools/call": "name",
+  "prompts/get": "name",
+  "resources/read": "uri",
+};
+
+// Per transports.mdx §Value Encoding: header values that aren't safe ASCII
+// are wrapped as `=?base64?<base64>?=`. Decode before comparing to the body.
+function decodeMcpHeaderValue(value: string): string {
+  const match = /^=\?base64\?(.+)\?=$/.exec(value);
+  if (!match) return value;
+  try {
+    return new TextDecoder().decode(Uint8Array.from(atob(match[1]), (c) => c.charCodeAt(0)));
+  } catch {
+    return value;
+  }
+}
+
+// Enforces the standard MCP request headers per transports.mdx §Server
+// Validation. The SDK only checks MCP-Protocol-Version (and only when
+// present), so the bridge owns Mcp-Method / Mcp-Name validation and the
+// "header is required" half of the protocol version check.
+function validateStandardHeaders(body: unknown, headers: Headers): Response | undefined {
+  const protoVersion = headers.get("mcp-protocol-version");
+  // Batches don't have a well-defined single source for Mcp-Method / Mcp-Name,
+  // so we only assert protocol-version presence here and let per-message
+  // version checks happen in validateWireVersions.
+  if (Array.isArray(body)) {
+    if (protoVersion === null) {
+      return errorResponse(400, null, HEADER_MISMATCH, "Missing required MCP-Protocol-Version header");
+    }
+    return undefined;
+  }
+
+  if (!isObject(body)) return undefined; // not a JSON-RPC envelope; SDK will reject
+
+  const id = requestId(body);
+
+  if (protoVersion === null) {
+    return errorResponse(400, id, HEADER_MISMATCH, "Missing required MCP-Protocol-Version header");
+  }
+
+  const bodyMethod = typeof body.method === "string" ? body.method : undefined;
+  if (bodyMethod !== undefined) {
+    const headerMethod = headers.get("mcp-method");
+    if (headerMethod === null) {
+      return errorResponse(400, id, HEADER_MISMATCH, "Missing required Mcp-Method header");
+    }
+    if (headerMethod !== bodyMethod) {
+      return errorResponse(
+        400,
+        id,
+        HEADER_MISMATCH,
+        `Mcp-Method header '${headerMethod}' does not match body method '${bodyMethod}'`,
+      );
+    }
+  }
+
+  const nameSource = bodyMethod !== undefined ? MCP_NAME_SOURCE[bodyMethod] : undefined;
+  if (nameSource !== undefined) {
+    const params = isObject(body.params) ? body.params : undefined;
+    const bodyName = params && typeof params[nameSource] === "string" ? (params[nameSource] as string) : undefined;
+    const headerName = headers.get("mcp-name");
+    if (bodyName === undefined) {
+      if (headerName !== null) {
+        return errorResponse(
+          400,
+          id,
+          HEADER_MISMATCH,
+          `Mcp-Name header set but body params.${nameSource} is missing`,
+        );
+      }
+    } else {
+      if (headerName === null) {
+        return errorResponse(400, id, HEADER_MISMATCH, "Missing required Mcp-Name header");
+      }
+      if (decodeMcpHeaderValue(headerName) !== bodyName) {
+        return errorResponse(
+          400,
+          id,
+          HEADER_MISMATCH,
+          `Mcp-Name header does not match body params.${nameSource}`,
+        );
+      }
+    }
+  }
+
+  return undefined;
+}
+
 function validateWireVersions(body: unknown, headerVersion: string | null): Response | undefined {
   for (const message of messagesFromBody(body)) {
     const id = requestId(message);
@@ -422,6 +514,8 @@ async function bridgedMcp(request: Request): Promise<Response> {
   if (rawBody.length > 0) {
     try {
       const json = JSON.parse(rawBody);
+      const headerError = validateStandardHeaders(json, headers);
+      if (headerError) return headerError;
       const validationError = validateWireVersions(json, headerVersion);
       if (validationError) return validationError;
 
