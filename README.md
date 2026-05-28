@@ -23,7 +23,7 @@ This repo is a small but complete server exercising the main moving parts of the
 
 ## A note on protocol version
 
-The TypeScript SDK this example links against still uses the placeholder string `DRAFT-2026-v1`. The published spec, the MCPJam backend, and Inspector PR #2303 have all moved to the final `2026-07-28` string. Rather than fork the SDK, `src/index.ts` includes a small HTTP shim that translates the version at the network edge — inbound `2026-07-28` is rewritten to `DRAFT-2026-v1` before the SDK sees it, and outbound responses are rewritten back. Once the SDK ships a build pinning `2026-07-28`, that whole shim block can be deleted.
+The TypeScript SDK this example links against still uses the placeholder string `DRAFT-2026-v1`. The published spec and MCPJam have all moved to the final `2026-07-28` string. Rather than fork the SDK, `src/index.ts` includes a small HTTP shim that translates the version at the network edge — inbound `2026-07-28` is rewritten to `DRAFT-2026-v1` before the SDK sees it, and outbound responses are rewritten back. Once the SDK ships a build pinning `2026-07-28`, that whole shim block can be deleted.
 
 ## Running locally
 
