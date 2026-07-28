@@ -3,16 +3,15 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "description": "Stateless MCP server (2026-07-28 RC) on Cloudflare Workers",
+  "description": "Stateless MCP server (2026-07-28) on Cloudflare Workers",
   "scripts": {
     "dev": "wrangler dev",
     "start": "wrangler dev",
     "deploy": "wrangler deploy",
-    "cf-typegen": "wrangler types",
-    "link-sdk": "node ./scripts/link-sdk.mjs",
-    "postinstall": "node ./scripts/link-sdk.mjs"
+    "cf-typegen": "wrangler types"
   },
   "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
     "zod": "^4.3.0"
   },
   "devDependencies": {

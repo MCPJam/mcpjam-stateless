@@ -1,6 +1,6 @@
 # mcpjam-stateless
 
-A reference MCP server demonstrating the **stateless** transport from the upcoming 2026-07-28 spec
+A reference MCP server demonstrating the **stateless** transport from the 2026-07-28 spec
 
 Live at **https://stateless.mcpjam.com/mcp**.
 
@@ -17,38 +17,24 @@ This repo is a small but complete server exercising the main moving parts of the
 - `server/discover` for version negotiation (replaces `initialize`)
 - Per-request `_meta` carrying protocol version, client info, and client capabilities
 - The standard HTTP header layer (`Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`) that lets proxies route and shape MCP traffic without parsing JSON bodies
-- **MRTR** (Multi-Round-Trip Requests) — how a stateless server asks the client for input (elicitation), an LLM completion (sampling), or filesystem roots, without the server ever initiating its own request
+- **MRTR** (Multi-Round-Trip Requests) — how a stateless server asks the client for input (elicitation), an LLM completion (sampling), or filesystem roots, without the server ever initiating its own request: the handler returns an `input_required` result, and the client replays the call with the responses attached
+- **Cacheable results** (SEP-2549) — list results and `server/discover` carry `ttlMs`/`cacheScope` so shared caches can serve them
 
-`subscriptions/listen` (long-lived server→client notification streams) is part of the spec but not advertised by this server: the SDK's in-memory subscription backend isn't safe across Worker requests yet.
+`subscriptions/listen` (long-lived server→client notification streams) is part of the spec but not advertised by this server: the SDK's default subscription bus is in-memory and per-isolate, which isn't meaningful across Worker requests.
 
-## A note on protocol version
-
-The TypeScript SDK this example links against still uses the placeholder string `DRAFT-2026-v1`. The published spec and MCPJam have all moved to the final `2026-07-28` string. Rather than fork the SDK, `src/index.ts` includes a small HTTP shim that translates the version at the network edge — inbound `2026-07-28` is rewritten to `DRAFT-2026-v1` before the SDK sees it, and outbound responses are rewritten back. Once the SDK ships a build pinning `2026-07-28`, that whole shim block can be deleted.
+The server is built on `@modelcontextprotocol/server` v2, which implements the 2026-07-28 revision natively — the whole HTTP surface (header validation, envelope checks, MRTR dispatch, cache fields, status mapping) is SDK behavior, not custom code. The endpoint is configured modern-only (`legacy: "reject"`), so 2025-era requests get an `Unsupported protocol version` error naming the supported revision.
 
 ## Running locally
 
-You need the TypeScript SDK checked out alongside this repo on the `fweinberger/v2-http-stateless` branch and built once:
-
-    ~/typescript-sdk/    # pnpm install && pnpm -r build
-    ~/mcpjam-stateless/  # this project
-
-Then:
-
-    npm install          # postinstall symlinks the SDK packages
+    npm install
     npm run dev          # wrangler dev on http://127.0.0.1:8787
-
-The `postinstall` step symlinks the SDK's `packages/server` and `packages/core` into `node_modules/@modelcontextprotocol/`. A plain `file:` dependency won't work because the SDK is a pnpm workspace using `catalog:` deps; symlinks let esbuild walk up to the SDK's own `node_modules` for transitive runtime deps like `zod` and `@cfworker/json-schema`.
-
-If your SDK checkout lives somewhere else:
-
-    MCP_TYPESCRIPT_SDK=/absolute/path/to/typescript-sdk npm install
 
 ## Tools exposed
 
 | Tool          | What it shows you                                                                                          |
 | ------------- | ---------------------------------------------------------------------------------------------------------- |
 | `echo`        | The plain happy path. Emits a log notification if the caller opts in via `_meta.logLevel`.                 |
-| `execute-sql` | The `x-mcp-header` annotation — the `region` argument is mirrored into an `Mcp-Param-Region` header.       |
+| `execute-sql` | The `x-mcp-header` annotation — the `region` argument is mirrored into an `Mcp-Param-Region` header (and the server rejects requests where they disagree). |
 | `ask-name`    | Server→client **elicitation** via MRTR. Requires `clientCapabilities.elicitation.form`.                    |
 | `summarize`   | Server→client **sampling** via MRTR. Requires `clientCapabilities.sampling`.                               |
 
@@ -78,12 +64,15 @@ Swap `https://stateless.mcpjam.com` for `http://127.0.0.1:8787` to point at a lo
 
 | Try this                                                                  | You get                                              |
 | ------------------------------------------------------------------------- | ---------------------------------------------------- |
-| Omit the `MCP-Protocol-Version` header                                    | `400 -32001 HeaderMismatch`                          |
-| Send an `MCP-Protocol-Version` header that disagrees with the body        | `400 -32001 HeaderMismatch`                          |
-| Send an `Mcp-Method` header that disagrees with the body's `method`       | `400 -32001 HeaderMismatch`                          |
-| Send an `Mcp-Name` header that disagrees with `params.name`               | `400 -32001 HeaderMismatch`                          |
-| Use the retired placeholder version `DRAFT-2026-v1`                       | `400 -32004 Unsupported protocol version`            |
+| Send an `MCP-Protocol-Version` header that disagrees with the body        | `400 -32020 HeaderMismatch`                          |
+| Send an `Mcp-Method` header that disagrees with the body's `method`, or omit it | `400 -32020 HeaderMismatch`                    |
+| Send an `Mcp-Name` header that disagrees with `params.name`, or omit it   | `400 -32020 HeaderMismatch`                          |
+| Call `execute-sql` with an `Mcp-Param-Region` header that disagrees with the `region` argument, or omit it | `400 -32020 HeaderMismatch` |
+| Use the retired placeholder version `DRAFT-2026-v1`                       | `400 -32022 Unsupported protocol version`            |
+| Send a 2025-era `initialize` request                                      | `400 -32022 Unsupported protocol version`            |
 | Call an unknown method                                                    | `404 -32601 Method not found`                        |
 | `GET` or `DELETE` on `/mcp`                                               | `405`                                                |
-| Call `ask-name` without declaring `clientCapabilities.elicitation`        | `400 -32003 MissingRequiredClientCapability`         |
+| Call `ask-name` without declaring `clientCapabilities.elicitation`        | `400 -32021 MissingRequiredClientCapability`         |
 | Call `ask-name` *with* the capability declared                            | `200`; result has `resultType: "input_required"` — MRTR in action |
+
+Note the `MCP-Protocol-Version` header is a **cross-check only**: omitting it is fine (the body's `_meta` envelope is authoritative), but sending one that contradicts the body is rejected.
