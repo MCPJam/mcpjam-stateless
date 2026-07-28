@@ -18,6 +18,10 @@
 //   * Prompts: completable arguments (completion/complete), icons.
 //   * subscriptions/listen: ack-first filtered notification streams fed by
 //     the `trigger-notifications` tool.
+//   * Tasks extension (io.modelcontextprotocol/tasks, SEP-2663): the
+//     `run-task` tool returns CreateTaskResult; tasks/get|update|cancel and
+//     task-aware listen streams are served by src/tasks.ts via the
+//     interception layer below.
 //
 // Run locally:  npm run dev    (Wrangler binds to http://127.0.0.1:8787/mcp)
 
@@ -37,6 +41,13 @@ import {
   type ServerContext,
 } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import {
+  handleTaskListen,
+  handleTasksMethod,
+  registerRunTaskTool,
+  tasksCapabilityDeclared,
+  TASKS_EXTENSION_ID,
+} from "./tasks";
 
 // Workers bill per-request CPU but not module evaluation — build the wire
 // schemas once at isolate warm-up instead of inside the first request.
@@ -88,7 +99,7 @@ const PROMPT_LANGUAGES = ["typescript", "python", "rust", "go", "swift", "kotlin
 
 function buildServer(): McpServer {
   const server = new McpServer(
-    { name: "mcpjam-stateless", version: "0.2.0" },
+    { name: "mcpjam-stateless", version: "0.3.0" },
     {
       capabilities: {
         tools: { listChanged: true },
@@ -96,6 +107,9 @@ function buildServer(): McpServer {
         resources: { subscribe: true, listChanged: true },
         completions: {},
         logging: {}, // deprecated (SEP-2577) but functional — kept on purpose so clients can test the deprecation path
+        // Tasks extension (SEP-2663) — served by the interception layer in
+        // src/tasks.ts, advertised here so server/discover reflects it.
+        extensions: { [TASKS_EXTENSION_ID]: {} },
       },
       instructions:
         "Reference 'everything' server for the 2026-07-28 stateless revision. " +
@@ -120,6 +134,7 @@ function buildServer(): McpServer {
   );
 
   registerTools(server);
+  registerRunTaskTool(server);
   registerResources(server);
   registerPrompts(server);
   return server;
@@ -802,6 +817,10 @@ const ALLOWED_HOSTS = [
   "stateless.mcpjam.com",
 ];
 
+// Methods the SDK cannot serve (tasks extension) are routed on the required
+// `Mcp-Method` header — its whole purpose is body-free routing (SEP-2243).
+const INTERCEPTED_METHODS = new Set(["tasks/get", "tasks/update", "tasks/cancel"]);
+
 export default {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -812,9 +831,79 @@ export default {
     }
     const rejected = hostHeaderValidationResponse(request, ALLOWED_HOSTS);
     if (rejected) return rejected;
+
+    // ── Tasks-extension interception (src/tasks.ts) ─────────
+    const headerMethod = request.headers.get("Mcp-Method");
+    if (request.method === "POST" && headerMethod !== null) {
+      if (INTERCEPTED_METHODS.has(headerMethod)) {
+        const body = await readJsonBody(request);
+        if (body === undefined) return Response.json(
+          { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
+          { status: 400 },
+        );
+        return handleTasksMethod(request, body);
+      }
+      // subscriptions/listen with a `taskIds` filter member: the SDK's filter
+      // schema would strip it, so those streams are served by the extension
+      // layer (which also bridges the core kinds off the same bus).
+      if (headerMethod === "subscriptions/listen") {
+        const body = await readJsonBody(request);
+        if (body !== undefined) {
+          const filter = (body.params as Record<string, unknown> | undefined)?.notifications as
+            | Record<string, unknown>
+            | undefined;
+          if (Array.isArray(filter?.taskIds)) {
+            const meta = (body.params as Record<string, unknown>)?._meta;
+            if (!tasksCapabilityDeclared(meta)) {
+              return Response.json({
+                jsonrpc: "2.0",
+                id: (body.id as string | number | null) ?? null,
+                error: {
+                  code: -32003,
+                  message: "Missing required client capability: task notifications require the tasks extension",
+                  data: { requiredCapabilities: { extensions: { [TASKS_EXTENSION_ID]: {} } } },
+                },
+              });
+            }
+            return handleTaskListen(request, body, mcp.bus);
+          }
+        }
+        return mcp.fetch(request);
+      }
+      // run-task requires the extension: a task-only tool MUST answer -32003
+      // to non-declaring clients (it cannot be serviced without a task, and
+      // the SDK's tool callbacks cannot emit JSON-RPC errors).
+      if (headerMethod === "tools/call" && request.headers.get("Mcp-Name") === "run-task") {
+        const body = await readJsonBody(request);
+        const meta = ((body?.params ?? {}) as Record<string, unknown>)._meta;
+        if (body !== undefined && !tasksCapabilityDeclared(meta)) {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: (body.id as string | number | null) ?? null,
+            error: {
+              code: -32003,
+              message: "Missing required client capability: run-task only executes as a task (tasks extension)",
+              data: { requiredCapabilities: { extensions: { [TASKS_EXTENSION_ID]: {} } } },
+            },
+          });
+        }
+        return mcp.fetch(request);
+      }
+    }
+
     return mcp.fetch(request);
   },
 };
+
+/** Peek the JSON body via clone() — the original request stays consumable. */
+async function readJsonBody(request: Request): Promise<Record<string, unknown> | undefined> {
+  try {
+    const parsed = JSON.parse(await request.clone().text());
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 function landingHtml(): string {
   return `<!doctype html>
@@ -823,7 +912,8 @@ function landingHtml(): string {
     <h1>mcpjam-stateless</h1>
     <p>"Everything" server for stateless MCP (2026-07-28). POST JSON-RPC to <code>/mcp</code>.</p>
     <p>Tools, resources, prompts, completions, MRTR (form/URL/sampling/roots/multi-round),
-       progress streams, and <code>subscriptions/listen</code>.</p>
+       progress streams, <code>subscriptions/listen</code>, and the Tasks extension
+       (<code>run-task</code> + <code>tasks/get|update|cancel</code> + <code>notifications/tasks</code>).</p>
   </div>
 </body></html>`;
 }

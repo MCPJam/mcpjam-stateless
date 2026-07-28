@@ -42,6 +42,7 @@ Every tool/prompt/resource demonstrates one protocol feature:
 | `list-client-roots` | **MRTR roots** (`roots/list`) — deliberately included so clients that *don't* support roots can test their rejection path |
 | `never-satisfied` | Infinite `input_required` loop — tests the client's max-rounds limit (`InputRequiredRoundsExceeded`) |
 | `trigger-notifications` | Publishes change events to open `subscriptions/listen` streams |
+| `run-task` | **Tasks extension**: returns `CreateTaskResult` (`resultType: "task"`) — see the Tasks section below |
 
 ### Resources
 
@@ -65,6 +66,53 @@ Every tool/prompt/resource demonstrates one protocol feature:
 Long-lived SSE stream with ack-first semantics: the server sends `notifications/subscriptions/acknowledged` (echoing the filter, stamped with `io.modelcontextprotocol/subscriptionId`) before any notification, then delivers **only** the opted-in notification types. Drive it with `trigger-notifications` from a second request.
 
 > Caveat: the change-event bus is in-memory per Workers isolate. The listen stream and the trigger call must land on the same isolate to observe delivery — normally true for a single client, and always true under `wrangler dev`.
+
+### Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663)
+
+The server advertises `capabilities.extensions["io.modelcontextprotocol/tasks"]` in `server/discover` and implements the full draft extension: `tasks/get`, `tasks/update`, `tasks/cancel`, `resultType: "task"` creation on `tools/call`, and `notifications/tasks` over `subscriptions/listen` with the `taskIds` filter member.
+
+The core SDK cannot serve extension methods, so they live in a thin interception layer (`src/tasks.ts`) in front of `createMcpHandler`, routed on the required `Mcp-Method` header. The one piece the SDK does carry is the create-task envelope itself: its 2026 encode contract passes a handler-provided `resultType` through verbatim on `tools/call`, so `run-task` is an ordinary registered tool.
+
+**`run-task` scenarios** (`scenario` argument):
+
+| Scenario | Lifecycle exercised |
+| --- | --- |
+| `complete` (default) | `working` → `completed` with a `CallToolResult` after `delayMs` |
+| `tool-error` | `working` → `completed` with `isError: true` (spec: tool errors are NOT `failed`) |
+| `protocol-error` | `working` → `failed` with a JSON-RPC `error` object |
+| `needs-input` | `working` → `input_required` (elicitation in `inputRequests`) → answer via `tasks/update` → `working` → `completed` using the answer |
+| `stubborn` | acks `tasks/cancel` but completes anyway (cancellation is cooperative) |
+
+Plus `confirm: true` on any scenario, which runs a synchronous MRTR elicitation *before* returning `CreateTaskResult` (the spec's recommended ordering), and `delayMs` to control the simulated work per phase.
+
+`run-task` is deliberately task-only: calling it without declaring the extension in per-request `clientCapabilities` answers `-32003 Missing required client capability` naming the extension — same for `tasks/*` methods and for `subscriptions/listen` filters containing `taskIds`. Per the extension's routing-header rule, `tasks/*` requests must carry `Mcp-Name: <taskId>`.
+
+**Statelessness**: task IDs are HMAC-signed tokens carrying the task's plan (scenario, delay, creation time), so create → poll-to-terminal → reconnect works across Workers isolates with zero storage — a `tasks/get` for a returned ID resolves immediately anywhere, as the spec requires. Mutations (`tasks/update` answers, cancellation) live in a per-isolate overlay, same caveat as the subscription bus. Tasks expire 10 minutes after creation (`ttlMs`), after which `tasks/get` answers `-32602 Task has expired`.
+
+```sh
+META_TASKS='"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"curl","version":"1"},"io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}}}'
+
+# Create a task…
+curl -s -X POST $BASE -H 'Content-Type: application/json' \
+  -H 'Mcp-Method: tools/call' -H 'Mcp-Name: run-task' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"run-task\",\"arguments\":{\"scenario\":\"needs-input\",\"delayMs\":2000},$META_TASKS}}"
+
+# …poll it (Mcp-Name carries the taskId)…
+curl -s -X POST $BASE -H 'Content-Type: application/json' \
+  -H 'Mcp-Method: tasks/get' -H "Mcp-Name: $TASK_ID" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tasks/get\",\"params\":{\"taskId\":\"$TASK_ID\",$META_TASKS}}"
+
+# …answer its elicitation…
+curl -s -X POST $BASE -H 'Content-Type: application/json' \
+  -H 'Mcp-Method: tasks/update' -H "Mcp-Name: $TASK_ID" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tasks/update\",\"params\":{\"taskId\":\"$TASK_ID\",\"inputResponses\":{\"name\":{\"action\":\"accept\",\"content\":{\"name\":\"Ada\"}}},$META_TASKS}}"
+
+# …or watch it over subscriptions/listen (ack intersects taskIds to known tasks)
+curl -sN -X POST $BASE -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Mcp-Method: subscriptions/listen' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"subscriptions/listen\",\"params\":{\"notifications\":{\"taskIds\":[\"$TASK_ID\"]},$META_TASKS}}"
+```
 
 ## Running locally
 
@@ -133,13 +181,16 @@ Note `resources/read` requires the `Mcp-Name` header carrying the URI (e.g. `-H 
 | Tamper with the `requestState` echoed by `confirm-launch`                 | `400 -32602 Invalid or expired requestState`         |
 | Read `demo://files/does-not-exist.md`                                     | `-32602` (resource not found)                        |
 | Keep answering `never-satisfied`                                          | Client-side `InputRequiredRoundsExceeded`            |
+| Call `run-task` / `tasks/*` / listen with `taskIds` without declaring the tasks extension | `-32003` naming the extension        |
+| `tasks/get` with a tampered or made-up `taskId`                           | `-32602 Task not found`                              |
+| `tasks/*` without `Mcp-Name: <taskId>`, or with a mismatching one         | `400 -32020`                                         |
+| `tasks/cancel` a `stubborn` task                                          | ack, then it completes anyway (cooperative cancel)   |
 
 The `MCP-Protocol-Version` header is a **cross-check only**: omitting it is fine (the body's `_meta` envelope is authoritative), but sending one that contradicts the body is rejected.
 
 ## Deliberately not included
 
-- **Tasks extension** (`io.modelcontextprotocol/tasks`) — versioned outside core; the v2 SDK's 2026 wire codec strips `capabilities.tasks` / `execution.taskSupport`, so a faithful tasks fixture needs the extension package, not core serving.
 - **Apps extension** (`io.modelcontextprotocol/ui`) — needs the `ext-apps` package and a host bridge; advertising an extension without its complete behavior would make this server a bad conformance target.
 - **Legacy (2025-era) serving** — the endpoint is `legacy: "reject"` on purpose, so it doubles as the "modern-only strict server" fixture. Flip to the SDK default (`legacy: "stateless"`) if you ever want one handler serving both eras.
 
-The `requestState` HMAC key in `src/index.ts` is deliberately public — this server holds no secrets; the point is exercising the mint/verify round-trip including tamper rejection.
+The `requestState` HMAC key in `src/index.ts` and the task-ID signing key in `src/tasks.ts` are deliberately public — this server holds no secrets; the point is exercising the mint/verify round-trips including tamper rejection.
