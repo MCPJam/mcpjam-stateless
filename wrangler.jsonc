@@ -5,6 +5,12 @@
   "compatibility_date": "2025-03-10",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+  // Task mutations (tasks/update answers, tasks/cancel) need to be visible
+  // from every isolate; each taskId gets a tiny self-expiring DO.
+  "durable_objects": {
+    "bindings": [{ "name": "TASK_OVERLAYS", "class_name": "TaskOverlays" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TaskOverlays"] }],
   "routes": [
     { "pattern": "stateless.mcpjam.com", "custom_domain": true }
   ]

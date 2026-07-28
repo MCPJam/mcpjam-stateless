@@ -47,7 +47,11 @@ import {
   registerRunTaskTool,
   tasksCapabilityDeclared,
   TASKS_EXTENSION_ID,
+  type TasksEnv,
 } from "./tasks";
+
+// The per-task overlay Durable Object must be exported from the entry module.
+export { TaskOverlays } from "./tasks";
 
 // Workers bill per-request CPU but not module evaluation — build the wire
 // schemas once at isolate warm-up instead of inside the first request.
@@ -99,7 +103,7 @@ const PROMPT_LANGUAGES = ["typescript", "python", "rust", "go", "swift", "kotlin
 
 function buildServer(): McpServer {
   const server = new McpServer(
-    { name: "mcpjam-stateless", version: "0.3.0" },
+    { name: "mcpjam-stateless", version: "0.3.1" },
     {
       capabilities: {
         tools: { listChanged: true },
@@ -822,7 +826,7 @@ const ALLOWED_HOSTS = [
 const INTERCEPTED_METHODS = new Set(["tasks/get", "tasks/update", "tasks/cancel"]);
 
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env?: TasksEnv): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname !== "/mcp") {
       return new Response(landingHtml(), {
@@ -841,7 +845,7 @@ export default {
           { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
           { status: 400 },
         );
-        return handleTasksMethod(request, body);
+        return handleTasksMethod(request, body, env);
       }
       // subscriptions/listen with a `taskIds` filter member: the SDK's filter
       // schema would strip it, so those streams are served by the extension
@@ -865,7 +869,7 @@ export default {
                 },
               });
             }
-            return handleTaskListen(request, body, mcp.bus);
+            return handleTaskListen(request, body, mcp.bus, env);
           }
         }
         return mcp.fetch(request);

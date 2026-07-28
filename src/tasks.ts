@@ -16,8 +16,11 @@
 // (scenario, delay, creation time), so the happy path — create, poll to
 // terminal, survive a reconnect — is computed from the ID alone and works
 // across Workers isolates with zero storage. Mutations (input answers,
-// cancellation) live in a per-isolate overlay map, same caveat as the
-// subscription bus. The signing key is deliberately public, like the
+// cancellation) live in a tiny per-task Durable Object so tasks/update and
+// tasks/cancel are visible from every isolate — a per-isolate map is only
+// the fallback when the binding is absent (plain tests) — while status
+// stays a pure function of (seed, overlay, now). The signing key is
+// deliberately public, like the
 // requestState key: this server holds no secrets; unguessability of the
 // embedded UUID still satisfies the spec's entropy requirement.
 
@@ -37,7 +40,7 @@ import { z } from "zod";
 
 export const TASKS_EXTENSION_ID = "io.modelcontextprotocol/tasks";
 const PROTOCOL_VERSION = "2026-07-28";
-const SERVER_INFO = { name: "mcpjam-stateless", version: "0.3.0" };
+const SERVER_INFO = { name: "mcpjam-stateless", version: "0.3.1" };
 
 const TASK_TTL_MS = 10 * 60_000;
 const POLL_INTERVAL_MS = 1_000;
@@ -103,7 +106,10 @@ async function decodeTaskId(taskId: string): Promise<TaskSeed | undefined> {
   }
 }
 
-// ── Per-isolate mutation overlay ────────────────────────────
+// ── Mutation overlay (Durable Object–backed) ────────────────
+// Status stays derivable from the signed ID alone; only the two mutating
+// verbs need shared state. Each taskId maps to its own DO, which holds one
+// tiny record and deletes itself via alarm after the task's TTL.
 
 interface TaskOverlay {
   answeredName?: string; // needs-input: accepted elicitation answer
@@ -112,17 +118,64 @@ interface TaskOverlay {
   cancelRequestedAtMs?: number;
 }
 
-const overlays = new Map<string, TaskOverlay>();
-const overlayFor = (taskId: string): TaskOverlay => {
-  let o = overlays.get(taskId);
-  if (!o) {
-    o = {};
-    overlays.set(taskId, o);
-    // Unbounded growth guard — records are tiny; TTL'd tasks dominate.
-    if (overlays.size > 10_000) overlays.clear();
+export interface TasksEnv {
+  TASK_OVERLAYS?: DurableObjectNamespace;
+}
+
+// First answer wins, first cancel wins — later patches to the same field
+// are ignored, so racing updates cannot rewind an already-resumed task.
+function mergeOverlay(current: TaskOverlay, patch: TaskOverlay): TaskOverlay {
+  if (patch.resumedAtMs !== undefined && current.resumedAtMs === undefined) {
+    current.answeredName = patch.answeredName;
+    current.declined = patch.declined;
+    current.resumedAtMs = patch.resumedAtMs;
   }
-  return o;
-};
+  if (patch.cancelRequestedAtMs !== undefined && current.cancelRequestedAtMs === undefined) {
+    current.cancelRequestedAtMs = patch.cancelRequestedAtMs;
+  }
+  return current;
+}
+
+export class TaskOverlays {
+  constructor(private state: DurableObjectState) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const current = ((await this.state.storage.get("overlay")) as TaskOverlay | undefined) ?? {};
+    if (request.method === "POST") {
+      mergeOverlay(current, (await request.json()) as TaskOverlay);
+      await this.state.storage.put("overlay", current);
+      // Self-destruct once the task's TTL has certainly elapsed.
+      await this.state.storage.setAlarm(Date.now() + TASK_TTL_MS);
+    }
+    return Response.json(current);
+  }
+
+  async alarm(): Promise<void> {
+    await this.state.storage.deleteAll();
+  }
+}
+
+// Fallback for environments without the binding (plain unit tests).
+const localOverlays = new Map<string, TaskOverlay>();
+
+async function getOverlay(env: TasksEnv | undefined, taskId: string): Promise<TaskOverlay> {
+  const ns = env?.TASK_OVERLAYS;
+  if (!ns) return localOverlays.get(taskId) ?? {};
+  const stub = ns.get(ns.idFromName(taskId));
+  return (await (await stub.fetch("https://task-overlays/")).json()) as TaskOverlay;
+}
+
+async function patchOverlay(env: TasksEnv | undefined, taskId: string, patch: TaskOverlay): Promise<void> {
+  const ns = env?.TASK_OVERLAYS;
+  if (!ns) {
+    const current = localOverlays.get(taskId) ?? {};
+    localOverlays.set(taskId, mergeOverlay(current, patch));
+    if (localOverlays.size > 10_000) localOverlays.clear();
+    return;
+  }
+  const stub = ns.get(ns.idFromName(taskId));
+  await stub.fetch("https://task-overlays/", { method: "POST", body: JSON.stringify(patch) });
+}
 
 // ── Lazy task evaluation ────────────────────────────────────
 // Status is a pure function of (seed, overlay, now) — no timers, so a poll
@@ -158,12 +211,11 @@ const NAME_ELICITATION = {
   },
 };
 
-export async function evaluateTask(taskId: string, now = Date.now()): Promise<Evaluation> {
+export async function evaluateTask(taskId: string, o: TaskOverlay, now = Date.now()): Promise<Evaluation> {
   const seed = await decodeTaskId(taskId);
   if (!seed) return { ok: false, reason: "not-found" };
   if (now > seed.c + TASK_TTL_MS) return { ok: false, reason: "expired" };
 
-  const o = overlays.get(taskId) ?? {};
   const base = {
     taskId,
     createdAt: iso(seed.c),
@@ -362,7 +414,7 @@ function checkEnvelopeAndHeaders(
 }
 
 /** Handle tasks/get, tasks/update, tasks/cancel. */
-export async function handleTasksMethod(request: Request, body: Json): Promise<Response> {
+export async function handleTasksMethod(request: Request, body: Json, env?: TasksEnv): Promise<Response> {
   const id = body.id;
   const method = body.method as string;
   const params = (body.params ?? {}) as Json;
@@ -373,7 +425,7 @@ export async function handleTasksMethod(request: Request, body: Json): Promise<R
   const bad = checkEnvelopeAndHeaders(request, body, taskId);
   if (bad) return bad;
 
-  const evaluation = await evaluateTask(taskId);
+  const evaluation = await evaluateTask(taskId, await getOverlay(env, taskId));
   if (!evaluation.ok) {
     const detail = evaluation.reason === "expired" ? "Task has expired" : "Task not found";
     return rpcError(id, -32602, `Failed to retrieve task: ${detail}`);
@@ -392,21 +444,20 @@ export async function handleTasksMethod(request: Request, body: Json): Promise<R
       // other keys are ignored per spec. Only act while it IS outstanding.
       if (evaluation.task.status === "input_required" && "name" in (responses as Json)) {
         const answer = (responses as Json).name as Json;
-        const o = overlayFor(taskId);
+        const patch: TaskOverlay = { resumedAtMs: Date.now() };
         if (answer?.action === "accept") {
           const content = answer.content as Json | undefined;
-          o.answeredName = typeof content?.name === "string" ? (content.name as string) : undefined;
+          patch.answeredName = typeof content?.name === "string" ? (content.name as string) : undefined;
         } else {
-          o.declined = true;
+          patch.declined = true;
         }
-        o.resumedAtMs = Date.now();
+        await patchOverlay(env, taskId, patch);
       }
       return rpcResult(id, {}); // empty, eventually-consistent ack
     }
 
     case "tasks/cancel": {
-      const o = overlayFor(taskId);
-      o.cancelRequestedAtMs ??= Date.now();
+      await patchOverlay(env, taskId, { cancelRequestedAtMs: Date.now() });
       return rpcResult(id, {}); // ack only — cancellation is cooperative
     }
 
@@ -438,7 +489,7 @@ function coreEventNotification(event: ServerEvent): { method: string; params?: J
   }
 }
 
-export async function handleTaskListen(request: Request, body: Json, bus: ServerEventBus): Promise<Response> {
+export async function handleTaskListen(request: Request, body: Json, bus: ServerEventBus, env?: TasksEnv): Promise<Response> {
   const id = body.id;
   const params = (body.params ?? {}) as Json;
   const filter = (params.notifications ?? {}) as Json;
@@ -455,7 +506,9 @@ export async function handleTaskListen(request: Request, body: Json, bus: Server
   const requestedIds = Array.isArray(filter.taskIds) ? (filter.taskIds as string[]) : [];
   const agreedIds: string[] = [];
   for (const taskId of requestedIds) {
-    if (typeof taskId === "string" && (await evaluateTask(taskId)).ok) agreedIds.push(taskId);
+    if (typeof taskId === "string" && (await evaluateTask(taskId, await getOverlay(env, taskId))).ok) {
+      agreedIds.push(taskId);
+    }
   }
   const honored: Json = {};
   if (filter.toolsListChanged === true) honored.toolsListChanged = true;
@@ -515,7 +568,7 @@ export async function handleTaskListen(request: Request, body: Json, bus: Server
         timers.push(
           setInterval(async () => {
             for (const taskId of [...watching]) {
-              const evaln = await evaluateTask(taskId);
+              const evaln = await evaluateTask(taskId, await getOverlay(env, taskId));
               if (!evaln.ok) {
                 watching.delete(taskId);
                 continue;
@@ -605,7 +658,8 @@ export function registerRunTaskTool(server: McpServer): void {
         }
       }
       const taskId = await mintTaskId(scenario, delayMs);
-      const seed = (await evaluateTask(taskId)) as { ok: true; task: DetailedTask };
+      // A just-minted task has no overlay yet — no storage read needed.
+      const seed = (await evaluateTask(taskId, {})) as { ok: true; task: DetailedTask };
       // The spec requires the task be durably resolvable BEFORE this result
       // is returned — trivially true here: the signed ID is self-describing.
       const createTaskResult = {
