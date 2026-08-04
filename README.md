@@ -194,3 +194,5 @@ The `MCP-Protocol-Version` header is a **cross-check only**: omitting it is fine
 - **Legacy (2025-era) serving** — the endpoint is `legacy: "reject"` on purpose, so it doubles as the "modern-only strict server" fixture. Flip to the SDK default (`legacy: "stateless"`) if you ever want one handler serving both eras.
 
 The `requestState` HMAC key in `src/index.ts` and the task-ID signing key in `src/tasks.ts` are deliberately public — this server holds no secrets; the point is exercising the mint/verify round-trips including tamper rejection.
+
+<!-- checks smoke: first real repo through the PR checker -->

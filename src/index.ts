@@ -459,7 +459,8 @@ function registerTools(server: McpServer): void {
     "summarize",
     {
       title: "Summarize text",
-      description: "Asks the client's LLM to summarize the given text.",
+      description:
+        "Asks the client's LLM to summarize the given text. Sampling is deprecated on 2026-07-28 and some clients (MCPJam included, by decision) don't declare it — those should surface a precise capability error, which is the test.",
       inputSchema: z.object({ text: z.string() }),
     },
     async ({ text }, ctx) => {
