@@ -38,7 +38,9 @@ import {
   ResourceTemplate,
   completable,
   type Icon,
+  type McpHttpHandler,
   type ServerContext,
+  type ServerNotifier,
 } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import {
@@ -49,9 +51,23 @@ import {
   TASKS_EXTENSION_ID,
   type TasksEnv,
 } from "./tasks";
+import { oddNamesHandler } from "./fixtures/oddNames";
+import {
+  INVALID_RUN_ID_MESSAGE,
+  isValidRunId,
+  readCalls,
+  receivedToolCalls,
+  recordCalls,
+  jsonError,
+  type RunsEnv,
+} from "./runs";
 
-// The per-task overlay Durable Object must be exported from the entry module.
+// Durable Objects must be exported from the entry module: the per-task
+// overlay, and the per-run call counter behind /runs/<run-id>/.
 export { TaskOverlays } from "./tasks";
+export { RunCallCounter } from "./runs";
+
+type Env = TasksEnv & RunsEnv;
 
 // Workers bill per-request CPU but not module evaluation — build the wire
 // schemas once at isolate warm-up instead of inside the first request.
@@ -101,7 +117,7 @@ const TEMPLATE_FILES: Record<string, { text: string; mimeType: string }> = {
 
 const PROMPT_LANGUAGES = ["typescript", "python", "rust", "go", "swift", "kotlin"];
 
-function buildServer(): McpServer {
+function buildServer(notify: ServerNotifier): McpServer {
   const server = new McpServer(
     { name: "mcpjam-stateless", version: "0.3.1" },
     {
@@ -137,7 +153,7 @@ function buildServer(): McpServer {
     },
   );
 
-  registerTools(server);
+  registerTools(server, notify);
   registerRunTaskTool(server);
   registerResources(server);
   registerPrompts(server);
@@ -148,7 +164,7 @@ function buildServer(): McpServer {
 // Tools
 // ════════════════════════════════════════════════════════════
 
-function registerTools(server: McpServer): void {
+function registerTools(server: McpServer, notify: ServerNotifier): void {
   // ── echo ────────────────────────────────────────────────────
   // Minimal happy path: validates inputSchema, emits a log notification
   // (only delivered if the request's `_meta.logLevel` opted in to `info`
@@ -547,8 +563,9 @@ function registerTools(server: McpServer): void {
   );
 
   // ── trigger-notifications ───────────────────────────────────
-  // Publishes a change event on the handler's subscription bus, delivered
-  // to every open `subscriptions/listen` stream whose filter opted in.
+  // Publishes a change event on the serving handler's subscription bus
+  // (`notify`), delivered to every open `subscriptions/listen` stream whose
+  // filter opted in.
   // NOTE: the bus is per-isolate — the listen stream and the trigger call
   // must land on the same Workers isolate to observe delivery (they
   // normally do for a single client; guaranteed under `wrangler dev`).
@@ -569,16 +586,16 @@ function registerTools(server: McpServer): void {
       const target = uri ?? "demo://counter";
       switch (event) {
         case "tools":
-          mcp.notify.toolsChanged();
+          notify.toolsChanged();
           break;
         case "prompts":
-          mcp.notify.promptsChanged();
+          notify.promptsChanged();
           break;
         case "resources":
-          mcp.notify.resourcesChanged();
+          notify.resourcesChanged();
           break;
         case "resource-updated":
-          mcp.notify.resourceUpdated(target);
+          notify.resourceUpdated(target);
           break;
       }
       return {
@@ -805,11 +822,32 @@ function registerPrompts(server: McpServer): void {
 // POST-only modern traffic, Content-Type, per-request envelopes, standard
 // headers (SEP-2243), cache fields (SEP-2549), status mapping — and serves
 // `subscriptions/listen` streams (ack-first, filtered, keepalives) fed by
-// the handler's change-event bus (`mcp.notify.*`).
+// the handler's change-event bus (`handler.notify.*`).
 //
 // `legacy: "reject"` makes the endpoint modern-only: 2025-era requests
 // (including `initialize`) get the unsupported-protocol-version error.
-const mcp = createMcpHandler(() => buildServer(), { legacy: "reject" });
+function createEverythingHandler(): McpHttpHandler {
+  // `trigger-notifications` publishes on the bus of the handler serving it.
+  const handler: McpHttpHandler = createMcpHandler(() => buildServer(handler.notify), { legacy: "reject" });
+  return handler;
+}
+
+const mcp = createEverythingHandler();
+
+// /runs/<run-id>/mcp serves the same server through a handler of its own per
+// run, so a subscriptions/listen stream in one run never sees change events
+// another run triggered. Like the bus, the map is per isolate; it is bounded,
+// and an evicted run's next request just starts a fresh handler.
+const MAX_RUN_HANDLERS = 128;
+const runHandlers = new Map<string, McpHttpHandler>();
+
+function everythingHandlerForRun(runId: string): McpHttpHandler {
+  const handler = runHandlers.get(runId) ?? createEverythingHandler();
+  runHandlers.delete(runId); // re-insert as the most recently used
+  runHandlers.set(runId, handler);
+  if (runHandlers.size > MAX_RUN_HANDLERS) runHandlers.delete(runHandlers.keys().next().value!);
+  return handler;
+}
 
 // DNS-rebinding guard. Accepts local dev hosts plus the deployed worker
 // hostname. Tighten if you bind a custom domain.
@@ -825,79 +863,141 @@ const ALLOWED_HOSTS = [
 // `Mcp-Method` header — its whole purpose is body-free routing (SEP-2243).
 const INTERCEPTED_METHODS = new Set(["tasks/get", "tasks/update", "tasks/cancel"]);
 
+// Endpoints, each also reachable below /runs/<run-id> with its tool calls
+// counted (src/runs.ts).
+type Endpoint = "everything" | "odd-names";
+const ENDPOINTS = new Map<string, Endpoint>([
+  ["/mcp", "everything"],
+  ["/fixtures/odd-names/mcp", "odd-names"],
+]);
+
 export default {
-  async fetch(request: Request, env?: TasksEnv): Promise<Response> {
+  async fetch(request: Request, env?: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname !== "/mcp") {
+    if (url.pathname.startsWith("/runs/")) return serveRun(request, url.pathname, env);
+
+    const endpoint = ENDPOINTS.get(url.pathname);
+    if (endpoint === undefined) {
+      if (url.pathname.startsWith("/fixtures/")) {
+        return jsonError(404, "No fixture at this path. See the README for fixture URLs.");
+      }
       return new Response(landingHtml(), {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     }
     const rejected = hostHeaderValidationResponse(request, ALLOWED_HOSTS);
     if (rejected) return rejected;
-
-    // ── Tasks-extension interception (src/tasks.ts) ─────────
-    const headerMethod = request.headers.get("Mcp-Method");
-    if (request.method === "POST" && headerMethod !== null) {
-      if (INTERCEPTED_METHODS.has(headerMethod)) {
-        const body = await readJsonBody(request);
-        if (body === undefined) return Response.json(
-          { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
-          { status: 400 },
-        );
-        return handleTasksMethod(request, body, env);
-      }
-      // subscriptions/listen with a `taskIds` filter member: the SDK's filter
-      // schema would strip it, so those streams are served by the extension
-      // layer (which also bridges the core kinds off the same bus).
-      if (headerMethod === "subscriptions/listen") {
-        const body = await readJsonBody(request);
-        if (body !== undefined) {
-          const filter = (body.params as Record<string, unknown> | undefined)?.notifications as
-            | Record<string, unknown>
-            | undefined;
-          if (Array.isArray(filter?.taskIds)) {
-            const meta = (body.params as Record<string, unknown>)?._meta;
-            if (!tasksCapabilityDeclared(meta)) {
-              return Response.json({
-                jsonrpc: "2.0",
-                id: (body.id as string | number | null) ?? null,
-                error: {
-                  code: -32003,
-                  message: "Missing required client capability: task notifications require the tasks extension",
-                  data: { requiredCapabilities: { extensions: { [TASKS_EXTENSION_ID]: {} } } },
-                },
-              });
-            }
-            return handleTaskListen(request, body, mcp.bus, env);
-          }
-        }
-        return mcp.fetch(request);
-      }
-      // run-task requires the extension: a task-only tool MUST answer -32003
-      // to non-declaring clients (it cannot be serviced without a task, and
-      // the SDK's tool callbacks cannot emit JSON-RPC errors).
-      if (headerMethod === "tools/call" && request.headers.get("Mcp-Name") === "run-task") {
-        const body = await readJsonBody(request);
-        const meta = ((body?.params ?? {}) as Record<string, unknown>)._meta;
-        if (body !== undefined && !tasksCapabilityDeclared(meta)) {
-          return Response.json({
-            jsonrpc: "2.0",
-            id: (body.id as string | number | null) ?? null,
-            error: {
-              code: -32003,
-              message: "Missing required client capability: run-task only executes as a task (tasks extension)",
-              data: { requiredCapabilities: { extensions: { [TASKS_EXTENSION_ID]: {} } } },
-            },
-          });
-        }
-        return mcp.fetch(request);
-      }
-    }
-
-    return mcp.fetch(request);
+    return endpoint === "everything" ? serveEverything(request, env, mcp) : oddNamesHandler.fetch(request);
   },
 };
+
+/** /runs/<run-id>/<endpoint> counts its tool calls; /runs/<run-id>/calls reads them. */
+async function serveRun(request: Request, pathname: string, env: Env | undefined): Promise<Response> {
+  const rejected = hostHeaderValidationResponse(request, ALLOWED_HOSTS);
+  if (rejected) return rejected;
+
+  const slash = pathname.indexOf("/", "/runs/".length);
+  const runId = pathname.slice("/runs/".length, slash < 0 ? undefined : slash);
+  const rest = slash < 0 ? "" : pathname.slice(slash);
+  if (!isValidRunId(runId)) return jsonError(400, INVALID_RUN_ID_MESSAGE);
+
+  if (rest === "/calls") {
+    if (request.method !== "GET") return jsonError(405, "Use GET to read a run's call counts.");
+    return readCalls(env, runId);
+  }
+  const endpoint = ENDPOINTS.get(rest);
+  if (endpoint === undefined) {
+    return jsonError(404, "No endpoint at this path. Append /mcp, /fixtures/odd-names/mcp or /calls to the run.");
+  }
+
+  // Count on receipt, before the server sees the request, and fail closed:
+  // a call the counter missed would undercount, which is worse than an error.
+  const names = await receivedToolCalls(request);
+  if (names.length > 0) {
+    try {
+      await recordCalls(env, runId, names);
+    } catch {
+      return Response.json(
+        {
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: -32603,
+            message: "The run's call counter is unavailable, so the call was not served. Try again.",
+          },
+        },
+        { status: 503 },
+      );
+    }
+  }
+  return endpoint === "everything"
+    ? serveEverything(request, env, everythingHandlerForRun(runId))
+    : oddNamesHandler.fetch(request);
+}
+
+/** The /mcp server: the tasks-extension layer in front of the SDK handler. */
+async function serveEverything(request: Request, env: Env | undefined, handler: McpHttpHandler): Promise<Response> {
+  // ── Tasks-extension interception (src/tasks.ts) ─────────
+  const headerMethod = request.headers.get("Mcp-Method");
+  if (request.method === "POST" && headerMethod !== null) {
+    if (INTERCEPTED_METHODS.has(headerMethod)) {
+      const body = await readJsonBody(request);
+      if (body === undefined) return Response.json(
+        { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
+        { status: 400 },
+      );
+      return handleTasksMethod(request, body, env);
+    }
+    // subscriptions/listen with a `taskIds` filter member: the SDK's filter
+    // schema would strip it, so those streams are served by the extension
+    // layer (which also bridges the core kinds off the same bus).
+    if (headerMethod === "subscriptions/listen") {
+      const body = await readJsonBody(request);
+      if (body !== undefined) {
+        const filter = (body.params as Record<string, unknown> | undefined)?.notifications as
+          | Record<string, unknown>
+          | undefined;
+        if (Array.isArray(filter?.taskIds)) {
+          const meta = (body.params as Record<string, unknown>)?._meta;
+          if (!tasksCapabilityDeclared(meta)) {
+            return Response.json({
+              jsonrpc: "2.0",
+              id: (body.id as string | number | null) ?? null,
+              error: {
+                code: -32003,
+                message: "Missing required client capability: task notifications require the tasks extension",
+                data: { requiredCapabilities: { extensions: { [TASKS_EXTENSION_ID]: {} } } },
+              },
+            });
+          }
+          return handleTaskListen(request, body, handler.bus, env);
+        }
+      }
+      return handler.fetch(request);
+    }
+    // run-task requires the extension: a task-only tool MUST answer -32003
+    // to non-declaring clients (it cannot be serviced without a task, and
+    // the SDK's tool callbacks cannot emit JSON-RPC errors).
+    if (headerMethod === "tools/call" && request.headers.get("Mcp-Name") === "run-task") {
+      const body = await readJsonBody(request);
+      const meta = ((body?.params ?? {}) as Record<string, unknown>)._meta;
+      if (body !== undefined && !tasksCapabilityDeclared(meta)) {
+        return Response.json({
+          jsonrpc: "2.0",
+          id: (body.id as string | number | null) ?? null,
+          error: {
+            code: -32003,
+            message: "Missing required client capability: run-task only executes as a task (tasks extension)",
+            data: { requiredCapabilities: { extensions: { [TASKS_EXTENSION_ID]: {} } } },
+          },
+        });
+      }
+      return handler.fetch(request);
+    }
+  }
+
+  return handler.fetch(request);
+}
 
 /** Peek the JSON body via clone() — the original request stays consumable. */
 async function readJsonBody(request: Request): Promise<Record<string, unknown> | undefined> {
@@ -918,6 +1018,8 @@ function landingHtml(): string {
     <p>Tools, resources, prompts, completions, MRTR (form/URL/sampling/roots/multi-round),
        progress streams, <code>subscriptions/listen</code>, and the Tasks extension
        (<code>run-task</code> + <code>tasks/get|update|cancel</code> + <code>notifications/tasks</code>).</p>
+    <p>Fixtures: odd tool names at <code>/fixtures/odd-names/mcp</code>. Prefix any endpoint with
+       <code>/runs/&lt;run-id&gt;</code> to count its tool calls, then <code>GET /runs/&lt;run-id&gt;/calls</code>.</p>
   </div>
 </body></html>`;
 }

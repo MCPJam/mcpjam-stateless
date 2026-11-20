@@ -2,7 +2,7 @@
 
 An **"everything" reference server** for the **stateless** transport from the 2026-07-28 MCP spec — one endpoint exercising every modern protocol feature, so a client (Inspector, CLI, conformance runner) can test the whole surface against a single server.
 
-Live at **https://stateless.mcpjam.com/mcp**.
+Live at **https://stateless.mcpjam.com/mcp**. Fixtures for testing hosts live beside it: odd tool names and a per-run call counter (see [Fixture endpoints](#fixture-endpoints)).
 
 ## What's "stateless" MCP?
 
@@ -114,10 +114,67 @@ curl -sN -X POST $BASE -H 'Content-Type: application/json' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"subscriptions/listen\",\"params\":{\"notifications\":{\"taskIds\":[\"$TASK_ID\"]},$META_TASKS}}"
 ```
 
+## Fixture endpoints
+
+Separate endpoints for testing how clients and hosts behave. `/mcp` itself stays exactly as described above.
+
+| URL | What it serves |
+| --- | --- |
+| `https://stateless.mcpjam.com/fixtures/odd-names/mcp` | Tools with odd names (below) |
+| `https://stateless.mcpjam.com/runs/<run-id>/mcp` | Everything `/mcp` serves, with tool calls counted |
+| `https://stateless.mcpjam.com/runs/<run-id>/fixtures/odd-names/mcp` | The odd names, with tool calls counted |
+| `GET https://stateless.mcpjam.com/runs/<run-id>/calls` | That run's counts: `{ "total": n, "byTool": { "<name>": n } }` |
+
+### Odd tool names (`/fixtures/odd-names/mcp`)
+
+| Tool name | Length | Why it's there |
+| --- | --- | --- |
+| `control` | 7 | A conforming name. If a host lists only this tool, it dropped every odd name. |
+| `dotted.tool.name` | 16 | Dots |
+| `slashed/tool/name` | 17 | Slashes (outside SEP-986's allowed characters) |
+| `collide.pair` | 12 | Collides with `collide_pair` when a host replaces characters outside `[A-Za-z0-9_-]` with `_` |
+| `collide_pair` | 12 | The other half of that pair |
+| `long_name_123456789012345678901234567890123456789012345678901234` | 64 | Exactly at the 64-character cap several hosts enforce |
+| `long_name_1234567890123456789012345678901234567890123456789012345` | 65 | One over: the 64-character name plus one, so a host that truncates to 64 makes the two identical |
+| `longest_allowed_name_23456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678` | 128 | The longest name SEP-986 allows |
+
+In the long names, each digit after the prefix is its 1-based position mod 10, so the last digit gives the length mod 10. Every tool takes an optional `message` and replies with its own exact name: `called <name> (<length> chars)`, plus `: <message>` when one was sent, and `structuredContent` of `{ tool, length, message? }`. A call that a host routed to the wrong tool shows up in the reply.
+
+Unlike `/mcp`, this endpoint also serves 2025-era clients (`initialize`, no per-request envelope), since many of the hosts worth testing still speak that protocol.
+
+### Per-run call counter (`/runs/<run-id>/…`)
+
+Prefix an endpoint with `/runs/<run-id>` and every `tools/call` request it receives is counted under the tool name the client sent. Then `GET /runs/<run-id>/calls` answers `{ total, byTool }`, which is how a QA run proves a host sent the server zero calls.
+
+- **Run ids** are yours to choose: 16 to 64 characters from `A-Z a-z 0-9 - _`. Use a fresh random one per run (a UUID works). Anything else gets `400`.
+- **What counts:** every `tools/call` request, counted on arrival under `params.name` exactly as sent, before the server validates anything. A call to a name the server doesn't have (say, a host's sanitized `dotted_tool_name`) and a call the server rejects both count. Each round of a multi-round (MRTR) call is its own request and counts once. Nothing else counts: `tools/list`, `server/discover` and the rest are free.
+- **Consistency:** a call is recorded before it is served, so its count is visible as soon as its response arrives. If the counter can't record a call, the call fails with HTTP `503` and JSON-RPC `-32603` instead of being served uncounted.
+- **A run nobody called** reads `{ "total": 0, "byTool": {} }`.
+- **Expiry:** a run's counts delete themselves 24 hours after its most recent counted call (a Durable Object alarm), and then read as zeros again. Read the counts during the run.
+- **Limits:** `total` counts every call; `byTool` itemizes up to 256 distinct names of up to 256 characters each.
+- **Isolation:** each run id is its own Durable Object, reachable only by its exact id. Nothing lists runs or totals across them, and `/runs/<run-id>/mcp` streams `subscriptions/listen` notifications only from `trigger-notifications` calls made in the same run.
+
+```sh
+RUN=$(uuidgen)
+BASE=https://stateless.mcpjam.com/runs/$RUN/fixtures/odd-names/mcp
+META='"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"curl","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}'
+
+# Point a host at $BASE (or https://stateless.mcpjam.com/runs/$RUN/mcp), or call a tool yourself…
+curl -s -X POST $BASE -H 'Content-Type: application/json' \
+  -H 'Mcp-Method: tools/call' -H 'Mcp-Name: dotted.tool.name' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"dotted.tool.name\",\"arguments\":{},$META}}"
+
+# …then read what the server received
+curl -s https://stateless.mcpjam.com/runs/$RUN/calls
+# {"total":1,"byTool":{"dotted.tool.name":1}}
+```
+
 ## Running locally
 
     npm install
     npm run dev          # wrangler dev on http://127.0.0.1:8787
+    npm test             # vitest: the default /mcp catalog, fixtures, and run counter
+    npm run typecheck
 
 ## Smoke test
 
