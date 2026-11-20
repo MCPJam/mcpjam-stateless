@@ -7,10 +7,18 @@
   "observability": { "enabled": true },
   // Task mutations (tasks/update answers, tasks/cancel) need to be visible
   // from every isolate; each taskId gets a tiny self-expiring DO.
+  // /runs/<run-id>/ call counts work the same way: one self-expiring DO per
+  // run id.
   "durable_objects": {
-    "bindings": [{ "name": "TASK_OVERLAYS", "class_name": "TaskOverlays" }]
+    "bindings": [
+      { "name": "TASK_OVERLAYS", "class_name": "TaskOverlays" },
+      { "name": "RUN_CALLS", "class_name": "RunCallCounter" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TaskOverlays"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["TaskOverlays"] },
+    { "tag": "v2", "new_sqlite_classes": ["RunCallCounter"] }
+  ],
   "routes": [
     { "pattern": "stateless.mcpjam.com", "custom_domain": true }
   ]
