@@ -1,0 +1,323 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`default /mcp endpoint > keeps its full server/discover result 1`] = `
+{
+  "_meta": {
+    "io.modelcontextprotocol/serverInfo": {
+      "name": "mcpjam-stateless",
+      "version": "0.3.1",
+    },
+  },
+  "cacheScope": "public",
+  "capabilities": {
+    "completions": {},
+    "extensions": {
+      "io.modelcontextprotocol/tasks": {},
+    },
+    "logging": {},
+    "prompts": {
+      "listChanged": true,
+    },
+    "resources": {
+      "listChanged": true,
+      "subscribe": true,
+    },
+    "tools": {
+      "listChanged": true,
+    },
+  },
+  "instructions": "Reference 'everything' server for the 2026-07-28 stateless revision. Every tool/prompt/resource demonstrates one protocol feature; call them in any order — nothing here has real side effects.",
+  "resultType": "complete",
+  "supportedVersions": [
+    "2026-07-28",
+  ],
+  "ttlMs": 300000,
+}
+`;
+
+exports[`default /mcp endpoint > keeps its full tools/list result 1`] = `
+{
+  "_meta": {
+    "io.modelcontextprotocol/serverInfo": {
+      "name": "mcpjam-stateless",
+      "version": "0.3.1",
+    },
+  },
+  "cacheScope": "public",
+  "resultType": "complete",
+  "tools": [
+    {
+      "annotations": {
+        "readOnlyHint": true,
+      },
+      "description": "Echo back the provided message.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "message": {
+            "type": "string",
+          },
+        },
+        "required": [
+          "message",
+        ],
+        "type": "object",
+      },
+      "name": "echo",
+      "title": "Echo",
+    },
+    {
+      "annotations": {
+        "readOnlyHint": false,
+      },
+      "description": "Run a SQL query against a regional database.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "query": {
+            "description": "SQL to execute.",
+            "type": "string",
+          },
+          "region": {
+            "description": "Target region (mirrored to Mcp-Param-Region).",
+            "type": "string",
+            "x-mcp-header": "Region",
+          },
+        },
+        "required": [
+          "region",
+          "query",
+        ],
+        "type": "object",
+      },
+      "name": "execute-sql",
+      "title": "Execute SQL",
+    },
+    {
+      "annotations": {
+        "readOnlyHint": true,
+      },
+      "description": "Deterministic fake weather — exercises outputSchema validation.",
+      "icons": [
+        {
+          "mimeType": "image/svg+xml",
+          "src": "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2032%2032%22%3E%3Ctext%20x%3D%2216%22%20y%3D%2224%22%20font-size%3D%2224%22%20text-anchor%3D%22middle%22%3E%E2%9B%85%3C%2Ftext%3E%3C%2Fsvg%3E",
+        },
+      ],
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "city": {
+            "type": "string",
+          },
+        },
+        "required": [
+          "city",
+        ],
+        "type": "object",
+      },
+      "name": "get-weather",
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "city": {
+            "type": "string",
+          },
+          "conditions": {
+            "enum": [
+              "sunny",
+              "cloudy",
+              "rainy",
+            ],
+            "type": "string",
+          },
+          "temperatureC": {
+            "type": "number",
+          },
+        },
+        "required": [
+          "city",
+          "temperatureC",
+          "conditions",
+        ],
+        "type": "object",
+      },
+      "title": "Get weather",
+    },
+    {
+      "description": "Runs N steps with a delay, emitting progress + log notifications on the response stream. Send \`_meta.progressToken\` to receive progress.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "delayMs": {
+            "default": 300,
+            "maximum": 2000,
+            "minimum": 0,
+            "type": "integer",
+          },
+          "steps": {
+            "default": 5,
+            "maximum": 10,
+            "minimum": 1,
+            "type": "integer",
+          },
+        },
+        "type": "object",
+      },
+      "name": "long-task",
+      "title": "Long-running task",
+    },
+    {
+      "description": "mode=result returns isError:true; mode=throw throws from the handler.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "mode": {
+            "enum": [
+              "result",
+              "throw",
+            ],
+            "type": "string",
+          },
+        },
+        "required": [
+          "mode",
+        ],
+        "type": "object",
+      },
+      "name": "fail",
+      "title": "Fail on purpose",
+    },
+    {
+      "description": "Elicits a name from the user (form mode), then greets them.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {},
+        "type": "object",
+      },
+      "name": "ask-name",
+      "title": "Ask the user's name",
+    },
+    {
+      "description": "Round 1 asks for confirmation, round 2 for a launch code — a two-round MRTR flow with signed requestState.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {},
+        "type": "object",
+      },
+      "name": "confirm-launch",
+      "title": "Confirm launch (two rounds)",
+    },
+    {
+      "description": "Asks the client to send the user to a URL, then reports the outcome.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {},
+        "type": "object",
+      },
+      "name": "open-dashboard",
+      "title": "Open dashboard (URL elicitation)",
+    },
+    {
+      "description": "Asks the client's LLM to summarize the given text.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "text": {
+            "type": "string",
+          },
+        },
+        "required": [
+          "text",
+        ],
+        "type": "object",
+      },
+      "name": "summarize",
+      "title": "Summarize text",
+    },
+    {
+      "description": "Embeds a roots/list request via MRTR. Clients that don't support roots should surface a precise capability error — that's the test.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {},
+        "type": "object",
+      },
+      "name": "list-client-roots",
+      "title": "List client roots",
+    },
+    {
+      "description": "Always asks again. Tests the client's input_required round limit.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {},
+        "type": "object",
+      },
+      "name": "never-satisfied",
+      "title": "Never satisfied (infinite MRTR loop)",
+    },
+    {
+      "description": "Publishes tools/prompts/resources list_changed or a resources/updated event to open subscriptions/listen streams.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "event": {
+            "enum": [
+              "tools",
+              "prompts",
+              "resources",
+              "resource-updated",
+            ],
+            "type": "string",
+          },
+          "uri": {
+            "description": "URI for resource-updated (default demo://counter).",
+            "type": "string",
+          },
+        },
+        "required": [
+          "event",
+        ],
+        "type": "object",
+      },
+      "name": "trigger-notifications",
+      "title": "Trigger subscription notifications",
+    },
+    {
+      "description": "Returns a CreateTaskResult (tasks extension) instead of a normal result — poll tasks/get to a terminal status. Scenarios: complete, tool-error (completed + isError), protocol-error (failed), needs-input (input_required → answer via tasks/update), stubborn (ignores tasks/cancel). confirm=true adds a synchronous MRTR elicitation BEFORE the task is created. Requires the io.modelcontextprotocol/tasks extension capability (else -32003).",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "confirm": {
+            "default": false,
+            "description": "Elicit a confirmation via MRTR before creating the task (spec: MRTR resolves synchronously, then CreateTaskResult).",
+            "type": "boolean",
+          },
+          "delayMs": {
+            "default": 5000,
+            "description": "Simulated work duration per phase.",
+            "maximum": 60000,
+            "minimum": 0,
+            "type": "integer",
+          },
+          "scenario": {
+            "default": "complete",
+            "enum": [
+              "complete",
+              "tool-error",
+              "protocol-error",
+              "needs-input",
+              "stubborn",
+            ],
+            "type": "string",
+          },
+        },
+        "type": "object",
+      },
+      "name": "run-task",
+      "title": "Run an asynchronous task",
+    },
+  ],
+  "ttlMs": 300000,
+}
+`;
